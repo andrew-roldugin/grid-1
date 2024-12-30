@@ -39,7 +39,7 @@ double **allocate_2D_array(int rows, int cols) {
     return array;
 }
 
-// Функция для освобождения двумерного массива
+// Функция для освобождения памяти двумерного массива
 void free_2D_array(double **array, int rows) {
     free(array[0]);
     free(array);
@@ -74,7 +74,7 @@ double **read_matrix(const char *filename, char *sources) {
                 sources[row * MATRIX_SIZE + col] = '~';
                 matrix[row][col] = atof(token + 1);
             } else {
-                sources[row * MATRIX_SIZE + col] = 'N'; // N - обычный узел
+                sources[row * MATRIX_SIZE + col] = 'N'; // обычный узел
                 matrix[row][col] = atof(token);
             }
             token = strtok(NULL, " \t\n");
@@ -88,8 +88,7 @@ double **read_matrix(const char *filename, char *sources) {
 }
 
 // Функция для записи матрицы в файл
-void write_matrix(const char *filename, double *matrix) {
-    FILE *file = fopen(filename, "w");
+void write_matrix(double *matrix, FILE * file) {
     if (!file) {
         perror("Не удалось открыть выходной файл");
         MPI_Abort(MPI_COMM_WORLD, 1);
@@ -97,38 +96,17 @@ void write_matrix(const char *filename, double *matrix) {
 
     for (int i = 0; i < MATRIX_SIZE; i++) {
         for (int j = 0; j < MATRIX_SIZE; j++) {
-            fprintf(file, "%.12f ", matrix[i * MATRIX_SIZE + j]);
+            fprintf(file, "%.8f ", matrix[i * MATRIX_SIZE + j]);
         }
         fprintf(file, "\n");
     }
-
-    fclose(file);
-}
-
-// Функция для записи матрицы в файл
-void write_matrix2(const char *filename, double **matrix) {
-    FILE *file = fopen(filename, "w");
-    if (!file) {
-        perror("Не удалось открыть выходной файл");
-        MPI_Abort(MPI_COMM_WORLD, 1);
-    }
-
-    for (int i = 0; i < MATRIX_SIZE; i++) {
-        for (int j = 0; j < MATRIX_SIZE; j++) {
-            fprintf(file, "%.2f ", matrix[i][j]);
-        }
-        fprintf(file, "\n");
-    }
-
-    fclose(file);
 }
 
 int main(int argc, char *argv[]) {
-    FILE *file2 = fopen("matrices", "w+");
-
     int rank, size;
     double **full_matrix = NULL;
     char *sources = NULL;
+    double time_start, time_finish;
 
     MPI_Init(&argc, &argv);
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
@@ -145,6 +123,7 @@ int main(int argc, char *argv[]) {
     // Имя файла с входными данными
     const char *input_file = argv[1];
 
+    time_start = MPI_Wtime();
     // Корневой процесс читает матрицу
     if (rank == 0) {
         sources = (char *) malloc(MATRIX_SIZE * MATRIX_SIZE * sizeof(char));
@@ -155,7 +134,7 @@ int main(int argc, char *argv[]) {
         full_matrix = read_matrix(input_file, sources);
     }
 
-    // Распространяем массив источников
+    // Распространяем массив тепловых источников
     if (rank != 0) {
         sources = (char *) malloc(MATRIX_SIZE * MATRIX_SIZE * sizeof(char));
         if (!sources) {
@@ -164,17 +143,13 @@ int main(int argc, char *argv[]) {
         }
     }
     MPI_Bcast(sources, MATRIX_SIZE * MATRIX_SIZE, MPI_CHAR, 0, MPI_COMM_WORLD);
-    printf("worker %d: sent sources matrix\n", rank);
-    fflush(stdout);
 
-    // Распространяем матрицу
+    // Распространяем матрицу теплового поля
     if (rank != 0) {
         full_matrix = allocate_2D_array(MATRIX_SIZE, MATRIX_SIZE);
     }
     // Преобразуем двумерный массив в одномерный для передачи
     MPI_Bcast(&(full_matrix[0][0]), MATRIX_SIZE * MATRIX_SIZE, MPI_DOUBLE, 0, MPI_COMM_WORLD);
-    printf("worker %d: sent main matrix\n", rank);
-    fflush(stdout);
 
     // Определяем количество строк на процесс
     int rows_per_proc = MATRIX_SIZE / size;
@@ -183,9 +158,6 @@ int main(int argc, char *argv[]) {
 
     // Определяем смещение
     int start_row = rank * rows_per_proc + (rank < remainder ? rank : remainder);
-
-    printf("Worker %d takes %d rows (from %d)\n", rank, local_rows, start_row + 1);
-    fflush(stdout);
 
     // Выделяем память для локальной части матрицы с дополнительными строками для обмена (ghost rows)
     double **local_current = allocate_2D_array(local_rows + 2, MATRIX_SIZE);
@@ -214,17 +186,14 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    printf("Worker %d | before evo\n", rank);
-    fflush(stdout);
-
-    // Итерации эволюции
+    // моделирование процесса эволюции теплового поля
     for (int iter = 0; iter < NUM_ITERATIONS; iter++) {
         MPI_Status status;
 
-        // Обмен верхней строкой
+        // обмен верхней строкой
         if (rank > 0) {
-            // Отправляем первую строку текущего процесса соседу сверху с тегом 0
-            // И одновременно получаем нижнюю границу соседу сверху с тегом 1
+            // отправляем первую строку текущего процесса соседу сверху с тегом 0
+            // и одновременно получаем нижнюю границу соседу сверху с тегом 1
             MPI_Sendrecv(local_current[1], MATRIX_SIZE, MPI_DOUBLE, rank - 1, 0,
                          local_current[0], MATRIX_SIZE, MPI_DOUBLE, rank - 1, 1,
                          MPI_COMM_WORLD, &status);
@@ -234,8 +203,6 @@ int main(int argc, char *argv[]) {
                 local_current[0][j] = 0.0; // Или любое другое фиксированное значение
             }
         }
-        printf("Worker %d | ifter if_1\n", rank);
-        fflush(stdout);
 
         // Обмен нижней строкой
         if (rank < size - 1) {
@@ -251,30 +218,9 @@ int main(int argc, char *argv[]) {
             }
         }
 
-        printf("Worker %d | ifter if_2\n", rank);
-        fflush(stdout);
-
-        printf("Worker %d | start updating field\n", rank);
-        fflush(stdout);
-
-        if (!file2) {
-            perror("Не удалось открыть выходной файл");
-            MPI_Abort(MPI_COMM_WORLD, 1);
-        }
-
-        MPI_Barrier(MPI_COMM_WORLD);
-        for (int i = 0; i < local_rows + 2; i++) {
-            fprintf(file2, "Worker %d ", rank);
-            for (int j = 0; j < MATRIX_SIZE; j++) {
-                fprintf(file2, "%f ", local_current[i][j]);
-            }
-            fprintf(file2, "\n");
-        }
-        fprintf(file2, "\n");
-        fflush(file2);
-
-        // Вычисление новых температур
+        // пересчет температур
         evolve_field(sources, local_rows, start_row, local_current, local_new, iter);
+        // обработка значений на границах области
         calc_bounds(sources, local_rows, start_row, local_current, local_new, iter);
 
         // Обновляем текущую матрицу
@@ -285,14 +231,11 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    printf("Worker %d | assembling...\n", rank);
-    fflush(stdout);
-
     double *final_matrix = NULL;
     int *recvcounts = NULL;
     int *displs = NULL;
 
-// Подготавливаем массивы для сбора данных
+    // Подготавливаем массивы для сбора данных
     if (rank == 0) {
         final_matrix = (double *) malloc(MATRIX_SIZE * MATRIX_SIZE * sizeof(double));
         recvcounts = (int *) malloc(size * sizeof(int));
@@ -306,35 +249,31 @@ int main(int argc, char *argv[]) {
             offset += rows;
         }
     }
-    printf("Worker %d | debug_1...\n", rank);
-    fflush(stdout);
 
-// Подготовка локальных данных для отправки
+    // Подготовка локальных данных для отправки
     double *send_buffer = (double *) malloc(local_rows * MATRIX_SIZE * sizeof(double));
     for (int i = 0; i < local_rows; i++) {
         memcpy(&send_buffer[i * MATRIX_SIZE], local_new[i], MATRIX_SIZE * sizeof(double));
     }
-    printf("Worker %d | debug_2...\n", rank);
-    fflush(stdout);
 
-
-// Собираем все части матрицы
+    // Собираем все части матрицы
     MPI_Gatherv(send_buffer, local_rows * MATRIX_SIZE, MPI_DOUBLE,
                 final_matrix, recvcounts, displs, MPI_DOUBLE,
                 0, MPI_COMM_WORLD);
 
-    printf("Worker %d | debug_3...\n", rank);
-    fflush(stdout);
-
     // Корневой процесс записывает итоговую матрицу
     if (rank == 0) {
+        FILE *file = fopen("output.txt", "w");
 
-        write_matrix("output.txt", final_matrix);
+        write_matrix(final_matrix, file);
         free(final_matrix);
         free(recvcounts);
         free(displs);
-        fclose(file2);
 
+        time_finish = MPI_Wtime();
+        fprintf(file, "\n\nВремя работы: %f", time_finish - time_start);
+
+        fclose(file);
     }
 
     free_2D_array(local_new, local_rows);
@@ -368,9 +307,6 @@ void evolve_field(const char *sources, int local_rows, int start_row, double *co
             }
 
             // Обновление температуры
-//                double newValue = DT * (ALPHA * ((up - 2.0 * center + down) / (DELTA_X * DELTA_X)
-//                                                 + (left - 2.0 * center + right) / (DELTA_Y * DELTA_Y)) + source_value);
-//                local_new[i - 1][j] = newValue;
             local_new[i - 1][j] = 0.25 * (up + down + left + right) + source_value;
         }
     }
