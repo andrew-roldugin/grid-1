@@ -2,175 +2,102 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 
-#define MAX_LINE_LENGTH 1024
+#define MATRIX_SIZE 100
+#define NUM_ITERATIONS 100
+#define MAX_LINE_LENGTH 10000
 
-#define NUM_ITER 1000 // Количество итераций
+// Функция для выделения двумерного массива
+double **allocate_2D_array(int rows, int cols) {
+    double *data = (double *) malloc(rows * cols * sizeof(double));
+    if (!data) {
+        perror("Не удалось выделить память для матрицы");
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+    double **array = (double **) malloc(rows * sizeof(double *));
+    if (!array) {
+        perror("Не удалось выделить память для указателей матрицы");
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+    for (int i = 0; i < rows; i++) {
+        array[i] = &(data[i * cols]);
+    }
+    return array;
+}
 
-// Параметры для моделирования процесса:
-#define ALPHA 0.1    // Коэффициент теплопроводности
-#define DT    0.1    // Шаг по времени для источников
+// Функция для освобождения двумерного массива
+void free_2D_array(double **array, int rows) {
+    free(array[0]);
+    free(array);
+}
 
-#define DELTA_X 1.0 // Шаг по пространству
-#define DELTA_Y 1.0 // Шаг по пространству
-
-
-// Функция для чтения начальных условий из файла
-void read_initial_conditions(const char *filename, double ***temperature, double ***Q, int *rows, int *cols) {
+// Функция для чтения матрицы из файла
+double **read_matrix(const char *filename, char *sources) {
     FILE *file = fopen(filename, "r");
     if (!file) {
-        perror("Не удалось открыть файл");
-        exit(EXIT_FAILURE);
+        perror("Не удалось открыть входной файл");
+        MPI_Abort(MPI_COMM_WORLD, 1);
     }
+
+    double **matrix = allocate_2D_array(MATRIX_SIZE, MATRIX_SIZE);
 
     char line[MAX_LINE_LENGTH];
-    int r = 0, c = 0;
+    int row = 0;
+    while (fgets(line, sizeof(line), file) && row < MATRIX_SIZE) {
+        // Пропускаем комментарии
+        if (line[0] == '#') continue;
 
-    // Сначала определим размер матрицы
-    *cols = 0; // Убедимся, что cols инициализирован
-    while (fgets(line, sizeof(line), file)) {
-        if (line[0] == '#' || line[0] == '\n') continue; // Пропускаем комментарии и пустые строки
-        c = 0;
-
-        char *context;
-        char *token = strtok_s(line, " \t\n", &context);
-        while (token) {
-            c++;
-            token = strtok_s(NULL, " \t\n", &context);
-        }
-        if (c > *cols)
-            *cols = c;
-        r++;
-    }
-    *rows = r;
-
-    // Выделяем память для матриц
-    *temperature = (double **) malloc(*rows * sizeof(double *));
-    *Q = (double **) malloc(*rows * sizeof(double *));
-    for (int i = 0; i < *rows; i++) {
-        (*temperature)[i] = (double *) malloc(*cols * sizeof(double));
-        (*Q)[i] = (double *) calloc(*cols, sizeof(double)); // Инициализируем Q нулями
-        if (!(*temperature)[i] || !(*Q)[i]) {
-            perror("Не удалось выделить память для матриц");
-            exit(EXIT_FAILURE);
-        }
-    }
-
-    rewind(file);
-    r = 0;
-    while (fgets(line, sizeof(line), file)) {
-        if (line[0] == '#' || line[0] == '\n') continue; // Пропускаем комментарии и пустые строки
-        c = 0;
-        char *context;
-        char *token = strtok_s(line, " \t\n", &context);
-
-        // Считываем данные в матрицы
-        while (token && c < *cols) {
-            if (token[0] == '+') {
-                (*Q)[r][c] = atof(token + 1); // Положительный источник
-                (*temperature)[r][c] = 0;
-            } else if (token[0] == '-') {
-                (*Q)[r][c] = -atof(token + 1); // Отрицательный источник
-                (*temperature)[r][c] = 0;
+        char *token = strtok(line, " \t\n");
+        int col = 0;
+        while (token && col < MATRIX_SIZE) {
+            if (token[0] == '-') {
+                sources[row * MATRIX_SIZE + col] = '-';
+                matrix[row][col] = atof(token + 1);
+            } else if (token[0] == '+') {
+                sources[row * MATRIX_SIZE + col] = '+';
+                matrix[row][col] = atof(token + 1);
+            } else if (token[0] == '~') {
+                sources[row * MATRIX_SIZE + col] = '~';
+                matrix[row][col] = atof(token + 1);
             } else {
-                (*Q)[r][c] = 0; // Нет источника
-                (*temperature)[r][c] = atof(token); // Начальная температура
+                sources[row * MATRIX_SIZE + col] = 'N'; // N - обычный узел
+                matrix[row][col] = atof(token);
             }
-            token = strtok_s(NULL, " \t\n", &context);
-            c++;
+            token = strtok(NULL, " \t\n");
+            col++;
         }
-        r++;
+        row++;
+    }
+
+    fclose(file);
+    return matrix;
+}
+
+// Функция для записи матрицы в файл
+void write_matrix(const char *filename, double **matrix) {
+    FILE *file = fopen(filename, "w");
+    if (!file) {
+        perror("Не удалось открыть выходной файл");
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+
+    for (int i = 0; i < MATRIX_SIZE; i++) {
+        for (int j = 0; j < MATRIX_SIZE; j++) {
+            fprintf(file, "%.2f ", matrix[i][j]);
+        }
+        fprintf(file, "\n");
     }
 
     fclose(file);
 }
 
-// Вспомогательная функция: распределяем строки между процессами «по блокам».
-// pcount  = сколько строк достаётся текущему процессу
-// pstart  = с какой строки начинаются данные для текущего процесса
-// Простейший равномерный подход: делим nrows на размер коммуникатора.
-void distribute_rows(int nrows, int rank, int size, int *pstart, int *pcount) {
-    int base = nrows / size;       // базовое количество строк на процесс
-    int extra = nrows % size;      // остаток, который надо распределить
-    // процессы с индексами меньше extra получают на 1 строку больше
-    if (rank < extra) {
-        *pcount = base + 1;
-        *pstart = rank * (base + 1);
-    } else {
-        *pcount = base;
-        *pstart = extra * (base + 1) + (rank - extra) * base;
-    }
-}
-
-void exchange_borders(double **temp_local, int local_rows, int ncols, int rank, int size) {
-    // Обмен верхней границей с процессом выше
-    if (rank > 0) {
-        // Отправляем верхнюю строку
-        MPI_Send(temp_local[0], ncols, MPI_DOUBLE, rank - 1, 0, MPI_COMM_WORLD);
-        // Получаем верхнюю строку
-        MPI_Recv(temp_local[-1], ncols, MPI_DOUBLE, rank - 1, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-    }
-
-    // Обмен нижней границей с процессом ниже
-    if (rank < size - 1) {
-        // Отправляем нижнюю строку
-        MPI_Send(temp_local[local_rows-1], ncols, MPI_DOUBLE, rank + 1, 0, MPI_COMM_WORLD);
-        // Получаем нижнюю строку
-        MPI_Recv(temp_local[local_rows], ncols, MPI_DOUBLE, rank + 1, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-    }
-}
-
-// Главная функция эволюции температурного поля на локальном участке.
-static void evolve_local_field(double **temp_local, double **source_local, int local_rows, int ncols, int rank, int size) {
-
-    // Создадим вспомогательный массив для новых значений
-    double **new_temp = (double **) malloc((local_rows + 2) * sizeof(double *));
-    for (int i = 0; i < local_rows + 2; i++) {
-        new_temp[i] = (double *) malloc(ncols * sizeof(double));
-    }
-
-    // Копируем данные из temp_local в new_temp, включая границы.
-    for (int i = 0; i < local_rows; i++) {
-        for (int j = 0; j < ncols; j++) {
-            new_temp[i + 1][j] = temp_local[i][j];
-        }
-    }
-
-    // Обновляем каждую «внутреннюю» ячейку (учитывая, что граничные строки
-    // у процессов будут обмениваться отдельно).
-    for (int i = 1; i < local_rows + 1; i++) {
-        for (int j = 1; j < ncols - 1; j++) {
-            double t_ij = new_temp[i][j];
-            double t_up = new_temp[i - 1][j];
-            double t_dn = new_temp[i + 1][j];
-            double t_lf = new_temp[i][j - 1];
-            double t_rt = new_temp[i][j + 1];
-
-            double diff_term = DT * (ALPHA * ((t_up - 2.0 * t_ij + t_dn) / (DELTA_X * DELTA_X)
-                                              + (t_lf - 2.0 * t_ij + t_rt) / (DELTA_Y * DELTA_Y)) + source_local[i - 1][j]);
-
-            new_temp[i][j] = t_ij + diff_term;
-        }
-    }
-
-    // Перенесём новые значения обратно в temp_local
-    for (int i = 0; i < local_rows; i++) {
-        for (int j = 0; j < ncols; j++) {
-            temp_local[i][j] = new_temp[i + 1][j];
-        }
-    }
-
-    // Освобождаем память
-    for (int i = 0; i < local_rows + 2; i++) {
-        free(new_temp[i]);
-    }
-    free(new_temp);
-}
-
 int main(int argc, char *argv[]) {
-    MPI_Init(&argc, &argv);
-
     int rank, size;
+    double **full_matrix = NULL;
+    char *sources = NULL;
+
+    MPI_Init(&argc, &argv);
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &size);
 
@@ -185,381 +112,255 @@ int main(int argc, char *argv[]) {
     // Имя файла с входными данными
     const char *input_file = argv[1];
 
-    // Матрицы и их размеры (определяются на root)
-    double **global_temp = NULL;
-    double **global_source = NULL;
-    int nrows = 0, ncols = 0;
-
-    // Читаем только на процессе 0
+    // Корневой процесс читает матрицу
     if (rank == 0) {
-        read_initial_conditions(input_file, &global_temp, &global_source, &nrows, &ncols);
-        printf("Размерность входных данных: %d x %d\n", nrows, ncols);
+        sources = (char *) malloc(MATRIX_SIZE * MATRIX_SIZE * sizeof(char));
+        if (!sources) {
+            perror("Не удалось выделить память для источников");
+            MPI_Abort(MPI_COMM_WORLD, 1);
+        }
+        full_matrix = read_matrix(input_file, sources);
     }
 
-    // Разошлём информацию о размерах nrows, ncols всем процессам
-    MPI_Bcast(&nrows, 1, MPI_INT, 0, MPI_COMM_WORLD);
-    MPI_Bcast(&ncols, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    // Распространяем массив источников
+    if (rank != 0) {
+        sources = (char *) malloc(MATRIX_SIZE * MATRIX_SIZE * sizeof(char));
+        if (!sources) {
+            perror("Не удалось выделить память для источников");
+            MPI_Abort(MPI_COMM_WORLD, 1);
+        }
+    }
+    MPI_Bcast(sources, MATRIX_SIZE * MATRIX_SIZE, MPI_CHAR, 0, MPI_COMM_WORLD);
+    printf("worker %d: sent sources matrix\n", rank);
+    fflush(stdout);
 
-    // Определим, какие строки достаются текущему процессу
-    int pstart, pcount;
-    distribute_rows(nrows, rank, size, &pstart, &pcount);
+    // Распространяем матрицу
+    if (rank != 0) {
+        full_matrix = allocate_2D_array(MATRIX_SIZE, MATRIX_SIZE);
+    }
+    // Преобразуем двумерный массив в одномерный для передачи
+    MPI_Bcast(&(full_matrix[0][0]), MATRIX_SIZE * MATRIX_SIZE, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+    printf("worker %d: sent main matrix\n", rank);
+    fflush(stdout);
 
-    if (!pcount) {
-        printf("Process %d has no work and is exiting.\n", rank);
-        size--;
-    } else {
+    // Определяем количество строк на процесс
+    int rows_per_proc = MATRIX_SIZE / size;
+    int remainder = MATRIX_SIZE % size;
+    int local_rows = rows_per_proc + (rank < remainder ? 1 : 0);
 
-        printf("Worker %d takes %d rows (from %d)\n", rank, pcount, pstart + 1);
+    // Определяем смещение
+    int start_row = rank * rows_per_proc + (rank < remainder ? rank : remainder);
+
+    printf("Worker %d takes %d rows (from %d)\n", rank, local_rows, start_row + 1);
+    fflush(stdout);
+
+    // Выделяем память для локальной части матрицы с дополнительными строками для обмена (ghost rows)
+    double **local_current = allocate_2D_array(local_rows + 2, MATRIX_SIZE);
+    double **local_new = allocate_2D_array(local_rows, MATRIX_SIZE);
+
+    // Инициализируем локальную текущую матрицу с граничными строками
+    for (int i = 0; i < local_rows + 2; i++) {
+        for (int j = 0; j < MATRIX_SIZE; j++) {
+            if (i == 0 || i == local_rows + 1) {
+                // Граничные условия сверху и снизу: фиксированные температуры (например, остаются неизменными)
+                if ((start_row + i - 1) < 0 || (start_row + i - 1) >= MATRIX_SIZE) {
+                    local_current[i][j] = 0.0;
+                } else if (i == 0 && start_row == 0) {
+                    // Верхняя граница
+                    local_current[i][j] = full_matrix[0][j];
+                } else if (i == local_rows + 1 && (start_row + i - 1) == MATRIX_SIZE - 1) {
+                    // Нижняя граница
+                    local_current[i][j] = full_matrix[MATRIX_SIZE - 1][j];
+                } else {
+                    local_current[i][j] = 0.0; // Внутренние граничные строки для обмена
+                }
+            } else {
+                int global_row = start_row + i - 1;
+                local_current[i][j] = full_matrix[global_row][j];
+            }
+        }
+    }
+
+    printf("Worker %d | before evo\n", rank);
+    fflush(stdout);
+
+    // Итерации эволюции
+    for (int iter = 0; iter < NUM_ITERATIONS; iter++) {
+        MPI_Status status;
+
+        // Обмен верхней строкой
+        if (rank > 0) {
+            // Отправляем первую строку текущего процесса соседу сверху с тегом 0
+            // И одновременно получаем нижнюю границу соседу сверху с тегом 1
+            MPI_Sendrecv(local_current[1], MATRIX_SIZE, MPI_DOUBLE, rank - 1, 0,
+                         local_current[0], MATRIX_SIZE, MPI_DOUBLE, rank - 1, 1,
+                         MPI_COMM_WORLD, &status);
+        } else {
+            // Для самого верхнего процесса устанавливаем граничную строку равной фиксированному значению
+            for (int j = 0; j < MATRIX_SIZE; j++) {
+                local_current[0][j] = 0.0; // Или любое другое фиксированное значение
+            }
+        }
+        printf("Worker %d | ifter if_1\n", rank);
         fflush(stdout);
 
-        // Каждый процесс выделит память под локальную часть строк:
-        double **temp_local = (double **) malloc(pcount * sizeof(double *));
-        double **source_local = (double **) malloc(pcount * sizeof(double *));
-        for (int i = 0; i < pcount; i++) {
-            temp_local[i] = (double *) malloc(ncols * sizeof(double));
-            source_local[i] = (double *) malloc(ncols * sizeof(double));
-        }
-
-        // Подготавливаем буфер для отправки/приёма строк
-        // Сериализуем строки как массив из ncols double
-        // Будем пользоваться MPI_Scatterv / MPI_Gatherv или вручную через MPI_Send/MPI_Recv
-        // Для простоты здесь – подход с MPI_Scatterv в духе "по строкам".
-        // Сперва подготовим массив displs и sendcounts для Scatterv.
-        int *sendcounts = (int *) malloc(size * sizeof(int));
-        int *displs = (int *) malloc(size * sizeof(int));
-        {
-            int offset = 0;
-            for (int i = 0; i < size; i++) {
-                int pst, pc;
-                distribute_rows(nrows, i, size, &pst, &pc);
-                sendcounts[i] = pc * ncols; // столько double на процесс
-                displs[i] = offset;
-                offset += pc * ncols;
+        // Обмен нижней строкой
+        if (rank < size - 1) {
+            // Отправляем последнюю строку текущего процесса соседу снизу с тегом 1
+            // И одновременно получаем верхнюю границу соседу снизу с тегом 0
+            MPI_Sendrecv(local_current[local_rows], MATRIX_SIZE, MPI_DOUBLE, rank + 1, 1,
+                         local_current[local_rows + 1], MATRIX_SIZE, MPI_DOUBLE, rank + 1, 0,
+                         MPI_COMM_WORLD, &status);
+        } else {
+            // Для самого нижнего процесса устанавливаем граничную строку равной фиксированному значению
+            for (int j = 0; j < MATRIX_SIZE; j++) {
+                local_current[local_rows + 1][j] = 0.0; // Или любое другое фиксированное значение
             }
         }
 
-        // Подготовим временные буферы на root
-        double *sendbuf_temp = NULL;
-        double *sendbuf_source = NULL;
-        if (rank == 0) {
-            sendbuf_temp = (double *) malloc(nrows * ncols * sizeof(double));
-            sendbuf_source = (double *) malloc(nrows * ncols * sizeof(double));
-            // Сериализуем global_temp и global_source в эти буферы.
-            int idx = 0;
-            for (int i = 0; i < nrows; i++) {
-                for (int j = 0; j < ncols; j++) {
-                    sendbuf_temp[idx] = global_temp[i][j];
-                    sendbuf_source[idx] = global_source[i][j];
-                    idx++;
-                }
-            }
-        }
-
-        // Локальные буферы для приёма:
-        double *recvbuf_temp = (double *) malloc(pcount * ncols * sizeof(double));
-        double *recvbuf_source = (double *) malloc(pcount * ncols * sizeof(double));
-
-        // Рассылаем данные
-        MPI_Scatterv(sendbuf_temp, sendcounts, displs, MPI_DOUBLE,
-                     recvbuf_temp, pcount * ncols, MPI_DOUBLE,
-                     0, MPI_COMM_WORLD);
-        MPI_Scatterv(sendbuf_source, sendcounts, displs, MPI_DOUBLE,
-                     recvbuf_source, pcount * ncols, MPI_DOUBLE,
-                     0, MPI_COMM_WORLD);
-
-        // Разложим принятые данные в двумерные локальные массивы
-        int idx = 0;
-        for (int i = 0; i < pcount; i++) {
-            for (int j = 0; j < ncols; j++) {
-                temp_local[i][j] = recvbuf_temp[idx];
-                source_local[i][j] = recvbuf_source[idx];
-                idx++;
-            }
-        }
-
-        // Память под sendbuf_temp/source можно освободить
-        if (rank == 0) {
-            free(sendbuf_temp);
-            free(sendbuf_source);
-        }
-        free(recvbuf_temp);
-        free(recvbuf_source);
-
-        // ----------------------------------------------------------------------------
-        // Основной цикл итераций
-        // ----------------------------------------------------------------------------
-        for (int iter = 0; iter < NUM_ITER; iter++) {
-            // Обмениваем «призрачные» (граничные) строки между соседними процессами
-            // Процесс собирается отправлять/принимать строку temp_local[0] (если есть верхний сосед)
-            // и temp_local[pcount-1] (если есть нижний сосед).
-
-            // Верхний сосед есть, если rank > 0
-            if (rank > 0) {
-                // Отправляем свою первую строку rank-1, получаем вниз последнюю строку от rank-1
-                MPI_Send(temp_local[0], ncols, MPI_DOUBLE, rank - 1, 0, MPI_COMM_WORLD);
-                MPI_Recv(temp_local[-1 + 1], ncols, MPI_DOUBLE, rank - 1, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-                // Аналогично отправляем source_local[0], чтобы при желании учитывать в «соседнем слое» (если нужно).
-                // В данном простом примере используем source локально, но при необходимости – аналогично.
-            }
-            // Нижний сосед есть, если rank < size-1
-            if (rank < size - 1) {
-                // Отправляем свою последнюю строку
-                MPI_Send(temp_local[pcount - 1], ncols, MPI_DOUBLE, rank + 1, 0, MPI_COMM_WORLD);
-                // Принимаем в temp_local[pcount] (условно, нужно дать «буфер»),
-                // но здесь у нас нет прямого pcount индекса. Обычно расширяют массив
-                // или дополнительно хранят буфер. Упростим, будем считать, что достаточно
-                // для «реальных» расчётов иметь строку pcount-1.
-                // В реальном коде нужно расширять на 2 строки (одну сверху, одну снизу).
-            }
-
-            // Обновляем поле (итерационная схема)
-            evolve_local_field(temp_local, source_local, pcount, ncols);
-        }
-
-        // ----------------------------------------------------------------------------
-        // Сбор результатов обратно на root
-        // ----------------------------------------------------------------------------
-        // Сериализуем локальные данные
-        double *gatherbuf_temp = (double *) malloc(pcount * ncols * sizeof(double));
-        idx = 0;
-        for (int i = 0; i < pcount; i++) {
-            for (int j = 0; j < ncols; j++) {
-                gatherbuf_temp[idx++] = temp_local[i][j];
-            }
-        }
-
-        // Подготовим для корня общий буфер
-        double *final_temp = NULL;
-        if (rank == 0) {
-            final_temp = (double *) malloc(nrows * ncols * sizeof(double));
-        }
-
-        // Собираем
-        MPI_Gatherv(gatherbuf_temp, pcount * ncols, MPI_DOUBLE,
-                    final_temp, sendcounts, displs, MPI_DOUBLE,
-                    0, MPI_COMM_WORLD);
-
-        // На root восстанавливаем двумерный массив и выводим/сохраняем
-        if (rank == 0) {
-            printf("\nРезультирующее температурное поле после %d итераций:\n", NUM_ITER);
-            int pos = 0;
-            for (int i = 0; i < nrows; i++) {
-                for (int j = 0; j < ncols; j++) {
-                    printf("%3.2f ", final_temp[pos++]);
-                }
-                printf("\n");
-            }
-            free(final_temp);
-
-            // Освободим глобальные входные данные
-            for (int i = 0; i < nrows; i++) {
-                free(global_temp[i]);
-                free(global_source[i]);
-            }
-            free(global_temp);
-            free(global_source);
-        }
-
-        // Освобождаем ресурсы
-        free(sendcounts);
-        free(displs);
-        free(gatherbuf_temp);
-
-        for (int i = 0; i < pcount; i++) {
-            free(temp_local[i]);
-            free(source_local[i]);
-        }
-        free(temp_local);
-        free(source_local);
-    }
-
-    MPI_Finalize();
-
-    return 0;
-}
-
-
-int main(int argc, char **argv) {
-    MPI_Init(&argc, &argv);
-
-    int rank, size;
-    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-    MPI_Comm_size(MPI_COMM_WORLD, &size);
-
-    if (argc < 2) {
-        if (rank == 0) {
-            fprintf(stderr, "Использование: %s <input_file>\n", argv[0]);
-        }
-        MPI_Finalize();
-        return 1;
-    }
-
-    // Имя файла с входными данными
-    const char *input_file = argv[1];
-
-    // Матрицы и их размеры (определяются на root)
-    double **global_temp = NULL;
-    double **global_source = NULL;
-    int nrows = 0, ncols = 0;
-
-    // Читаем только на процессе 0
-    if (rank == 0) {
-        read_initial_conditions(input_file, &global_temp, &global_source, &nrows, &ncols);
-        printf("Размерность входных данных: %d x %d\n", nrows, ncols);
-    }
-
-    // Разошлём информацию о размерах nrows, ncols всем процессам
-    MPI_Bcast(&nrows, 1, MPI_INT, 0, MPI_COMM_WORLD);
-    MPI_Bcast(&ncols, 1, MPI_INT, 0, MPI_COMM_WORLD);
-
-    // Определим, какие строки достаются текущему процессу
-    int pstart, pcount;
-    distribute_rows(nrows, rank, size, &pstart, &pcount);
-
-    if (!pcount) {
-        printf("Process %d has no work and is exiting.\n", rank);
-        size--;
-    } else {
-
-        printf("Worker %d takes %d rows (from %d)\n", rank, pcount, pstart + 1);
+        printf("Worker %d | ifter if_2\n", rank);
         fflush(stdout);
 
+        printf("Worker %d | start updating field\n", rank);
+        fflush(stdout);
+        // Вычисление новых температур
+        for (int i = 1; i <= local_rows; i++) {
+            for (int j = 1; j < MATRIX_SIZE - 1; j++) {
+                // Среднее значение соседних ячеек
+                double up = local_current[i - 1][j];
+                double down = local_current[i + 1][j];
+                double left = local_current[i][j - 1];
+                double right = local_current[i][j + 1];
+                double center = local_current[i][j];
 
-        // Каждый процесс выделит память под локальную часть строк:
-        double **temp_local = (double **) malloc(pcount * sizeof(double *));
-        double **source_local = (double **) malloc(pcount * sizeof(double *));
-        for (int i = 0; i < pcount; i++) {
-            temp_local[i] = (double *) malloc(ncols * sizeof(double));
-            source_local[i] = (double *) malloc(ncols * sizeof(double));
-        }
-
-        // Подготавливаем буфер для отправки/приёма строк
-        // Сериализуем строки как массив из ncols double
-        // Будем пользоваться MPI_Scatterv / MPI_Gatherv или вручную через MPI_Send/MPI_Recv
-        // Для простоты здесь – подход с MPI_Scatterv в духе "по строкам".
-        // Сперва подготовим массив displs и sendcounts для Scatterv.
-        int *sendcounts = (int *) malloc(size * sizeof(int));
-        int *displs = (int *) malloc(size * sizeof(int));
-        {
-            int offset = 0;
-            for (int i = 0; i < size; i++) {
-                int pst, pc;
-                distribute_rows(nrows, i, size, &pst, &pc);
-                sendcounts[i] = pc * ncols; // столько double на процесс
-                displs[i] = offset;
-                offset += pc * ncols;
-            }
-        }
-
-        // Подготовим временные буферы на root
-        double *sendbuf_temp = NULL;
-        double *sendbuf_source = NULL;
-        if (rank == 0) {
-            sendbuf_temp = (double *) malloc(nrows * ncols * sizeof(double));
-            sendbuf_source = (double *) malloc(nrows * ncols * sizeof(double));
-            // Сериализуем global_temp и global_source в эти буферы.
-            int idx = 0;
-            for (int i = 0; i < nrows; i++) {
-                for (int j = 0; j < ncols; j++) {
-                    sendbuf_temp[idx] = global_temp[i][j];
-                    sendbuf_source[idx] = global_source[i][j];
-                    idx++;
+                // Применение источников тепла
+                char source = sources[(start_row + i - 1) * MATRIX_SIZE + j];
+                double source_value = 0.0;
+                if (source == '-') {
+                    source_value = -0.1 * center; // Поглощение тепла
+                } else if (source == '+') {
+                    source_value = 0.1 * (100.0 - center); // Выделение тепла
+                } else if (source == '~') {
+                    // Переменный источник: синусоидальный сигнал
+                    source_value = 0.05 * sin(iter * 0.1);
                 }
+
+                // Обновление температуры
+                local_new[i - 1][j] = 0.25 * (up + down + left + right) + source_value;
+            }
+            // Обработка граничных столбцов (левая и правая границы остаются фиксированными)
+            // Левая граница
+            int j = 0;
+            double up = local_current[i - 1][j];
+            double down = local_current[i + 1][j];
+            double left = local_current[i][j]; // Инсулированная граница (изолированная)
+            double right = local_current[i][j + 1];
+            double center = local_current[i][j];
+
+            char source = sources[(start_row + i - 1) * MATRIX_SIZE + j];
+            double source_value = 0.0;
+            if (source == '-') {
+                source_value = -0.1 * center;
+            } else if (source == '+') {
+                source_value = 0.1 * (100.0 - center);
+            } else if (source == '~') {
+                source_value = 0.05 * sin(iter * 0.1);
+            }
+
+            local_new[i - 1][j] = 0.25 * (up + down + left + right) + source_value;
+
+            // Правая граница
+            j = MATRIX_SIZE - 1;
+            up = local_current[i - 1][j];
+            down = local_current[i + 1][j];
+            left = local_current[i][j - 1];
+            right = local_current[i][j]; // Инсулированная граница (изолированная)
+            center = local_current[i][j];
+
+            source = sources[(start_row + i - 1) * MATRIX_SIZE + j];
+            source_value = 0.0;
+            if (source == '-') {
+                source_value = -0.1 * center;
+            } else if (source == '+') {
+                source_value = 0.1 * (100.0 - center);
+            } else if (source == '~') {
+                source_value = 0.05 * sin(iter * 0.1);
+            }
+
+            local_new[i - 1][j] = 0.25 * (up + down + left + right) + source_value;
+        }
+
+        // Обновляем текущую матрицу
+        for (int i = 1; i <= local_rows; i++) {
+            for (int j = 0; j < MATRIX_SIZE; j++) {
+                local_current[i][j] = local_new[i - 1][j];
             }
         }
-
-        // Локальные буферы для приёма:
-        double *recvbuf_temp = (double *) malloc(pcount * ncols * sizeof(double));
-        double *recvbuf_source = (double *) malloc(pcount * ncols * sizeof(double));
-
-        // Рассылаем данные
-        MPI_Scatterv(sendbuf_temp, sendcounts, displs, MPI_DOUBLE,
-                     recvbuf_temp, pcount * ncols, MPI_DOUBLE,
-                     0, MPI_COMM_WORLD);
-        MPI_Scatterv(sendbuf_source, sendcounts, displs, MPI_DOUBLE,
-                     recvbuf_source, pcount * ncols, MPI_DOUBLE,
-                     0, MPI_COMM_WORLD);
-
-        // Разложим принятые данные в двумерные локальные массивы
-        int idx = 0;
-        for (int i = 0; i < pcount; i++) {
-            for (int j = 0; j < ncols; j++) {
-                temp_local[i][j] = recvbuf_temp[idx];
-                source_local[i][j] = recvbuf_source[idx];
-                idx++;
-            }
-        }
-
-        // Память под sendbuf_temp/source можно освободить
-        if (rank == 0) {
-            free(sendbuf_temp);
-            free(sendbuf_source);
-        }
-        free(recvbuf_temp);
-        free(recvbuf_source);
-
-        // Основной цикл расчета
-        for (int iter = 0; iter < NUM_ITER; iter++) {
-            exchange_borders(temp_local, local_rows, ncols, rank, size);
-            evolve_local_field(temp_local, source_local, local_rows, ncols, rank, size);
-        }
-
-        // ----------------------------------------------------------------------------
-        // Сбор результатов обратно на root
-        // ----------------------------------------------------------------------------
-        // Сериализуем локальные данные
-        double *gatherbuf_temp = (double *) malloc(pcount * ncols * sizeof(double));
-        idx = 0;
-        for (int i = 0; i < pcount; i++) {
-            for (int j = 0; j < ncols; j++) {
-                gatherbuf_temp[idx++] = temp_local[i][j];
-            }
-        }
-
-        // Подготовим для корня общий буфер
-        double *final_temp = NULL;
-        if (rank == 0) {
-            final_temp = (double *) malloc(nrows * ncols * sizeof(double));
-        }
-
-        // Собираем
-        MPI_Gatherv(gatherbuf_temp, pcount * ncols, MPI_DOUBLE,
-                    final_temp, sendcounts, displs, MPI_DOUBLE,
-                    0, MPI_COMM_WORLD);
-
-        // На root восстанавливаем двумерный массив и выводим/сохраняем
-        if (rank == 0) {
-            printf("\nРезультирующее температурное поле после %d итераций:\n", NUM_ITER);
-            int pos = 0;
-            for (int i = 0; i < nrows; i++) {
-                for (int j = 0; j < ncols; j++) {
-                    printf("%3.2f ", final_temp[pos++]);
-                }
-                printf("\n");
-            }
-            free(final_temp);
-
-            // Освободим глобальные входные данные
-            for (int i = 0; i < nrows; i++) {
-                free(global_temp[i]);
-                free(global_source[i]);
-            }
-            free(global_temp);
-            free(global_source);
-        }
-
-        // Освобождаем ресурсы
-        free(sendcounts);
-        free(displs);
-        free(gatherbuf_temp);
-
-        for (int i = 0; i < pcount; i++) {
-            free(temp_local[i]);
-            free(source_local[i]);
-        }
-        free(temp_local);
-        free(source_local);
     }
+
+    printf("Worker %d | assembling...\n", rank);
+    fflush(stdout);
+
+    // Собираем результаты на корневом процессе
+//    double **final_matrix = NULL;
+    double *final_matrix = NULL; // Изменили тип на одномерный массив
+    if (rank == 0) {
+        final_matrix = allocate_2D_array(MATRIX_SIZE, MATRIX_SIZE);
+    }
+
+    // Подготавливаем recvcounts и displs для граничного процесса
+    int *recvcounts = NULL;
+    int *displs = NULL;
+    if (rank == 0) {
+        recvcounts = (int *)malloc(size * sizeof(int));
+        displs = (int *)malloc(size * sizeof(int));
+        if (!recvcounts || !displs) {
+            perror("Не удалось выделить память для recvcounts или displs");
+            MPI_Abort(MPI_COMM_WORLD, 1);
+        }
+
+        int offset = 0;
+        for (int i = 0; i < size; i++) {
+            recvcounts[i] = (rows_per_proc + (i < remainder ? 1 : 0)) * MATRIX_SIZE;
+            displs[i] = offset;
+            offset += recvcounts[i];
+        }
+    }
+
+    printf("Worker %d | debug_1...\n", rank);
+    fflush(stdout);
+
+    // Подготовка буфера для отправки
+    double *send_buffer = (double *)malloc(local_rows * MATRIX_SIZE * sizeof(double));
+    if (!send_buffer) {
+        perror("Не удалось выделить память для send_buffer");
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+    for (int i = 0; i < local_rows; i++) {
+        memcpy(&send_buffer[i * MATRIX_SIZE], local_new[i], MATRIX_SIZE * sizeof(double));
+    }
+
+    printf("Worker %d | debug_2...\n", rank);
+    fflush(stdout);
+
+    // Собираем все части матрицы
+    MPI_Gatherv(send_buffer, local_rows * MATRIX_SIZE, MPI_DOUBLE,
+                (rank == 0) ? &(final_matrix[0]) : NULL, recvcounts, displs, MPI_DOUBLE,
+                0, MPI_COMM_WORLD);
+
+    printf("Worker %d | debug_3...\n", rank);
+    fflush(stdout);
+
+    // Корневой процесс записывает итоговую матрицу
+    if (rank == 0) {
+        write_matrix("output.txt", final_matrix);
+        free_2D_array(final_matrix, MATRIX_SIZE);
+        free(recvcounts);
+        free(displs);
+    }
+
+    free_2D_array(local_new, local_rows);
+    free(send_buffer);
 
     MPI_Finalize();
     return 0;
