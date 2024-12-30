@@ -8,6 +8,19 @@
 #define NUM_ITERATIONS 100
 #define MAX_LINE_LENGTH 10000
 
+// Параметры для моделирования процесса:
+#define ALPHA 0.25    // Коэффициент теплопроводности
+#define DT    0.5    // Шаг по времени для источников
+
+#define DELTA_X 1.0 // Шаг по пространству
+#define DELTA_Y 1.0 // Шаг по пространству
+
+void evolve_field(const char *sources, int local_rows, int start_row, double *const *local_current, double **local_new,
+                  int iter);
+
+void calc_bounds(const char *sources, int local_rows, int start_row, double *const *local_current, double **local_new,
+                 int iter);
+
 // Функция для выделения двумерного массива
 double **allocate_2D_array(int rows, int cols) {
     double *data = (double *) malloc(rows * cols * sizeof(double));
@@ -75,7 +88,25 @@ double **read_matrix(const char *filename, char *sources) {
 }
 
 // Функция для записи матрицы в файл
-void write_matrix(const char *filename, double **matrix) {
+void write_matrix(const char *filename, double *matrix) {
+    FILE *file = fopen(filename, "w");
+    if (!file) {
+        perror("Не удалось открыть выходной файл");
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+
+    for (int i = 0; i < MATRIX_SIZE; i++) {
+        for (int j = 0; j < MATRIX_SIZE; j++) {
+            fprintf(file, "%.2f ", matrix[i * MATRIX_SIZE + j]);
+        }
+        fprintf(file, "\n");
+    }
+
+    fclose(file);
+}
+
+// Функция для записи матрицы в файл
+void write_matrix2(const char *filename, double **matrix) {
     FILE *file = fopen(filename, "w");
     if (!file) {
         perror("Не удалось открыть выходной файл");
@@ -224,71 +255,8 @@ int main(int argc, char *argv[]) {
         printf("Worker %d | start updating field\n", rank);
         fflush(stdout);
         // Вычисление новых температур
-        for (int i = 1; i <= local_rows; i++) {
-            for (int j = 1; j < MATRIX_SIZE - 1; j++) {
-                // Среднее значение соседних ячеек
-                double up = local_current[i - 1][j];
-                double down = local_current[i + 1][j];
-                double left = local_current[i][j - 1];
-                double right = local_current[i][j + 1];
-                double center = local_current[i][j];
-
-                // Применение источников тепла
-                char source = sources[(start_row + i - 1) * MATRIX_SIZE + j];
-                double source_value = 0.0;
-                if (source == '-') {
-                    source_value = -0.1 * center; // Поглощение тепла
-                } else if (source == '+') {
-                    source_value = 0.1 * (100.0 - center); // Выделение тепла
-                } else if (source == '~') {
-                    // Переменный источник: синусоидальный сигнал
-                    source_value = 0.05 * sin(iter * 0.1);
-                }
-
-                // Обновление температуры
-                local_new[i - 1][j] = 0.25 * (up + down + left + right) + source_value;
-            }
-            // Обработка граничных столбцов (левая и правая границы остаются фиксированными)
-            // Левая граница
-            int j = 0;
-            double up = local_current[i - 1][j];
-            double down = local_current[i + 1][j];
-            double left = local_current[i][j]; // Инсулированная граница (изолированная)
-            double right = local_current[i][j + 1];
-            double center = local_current[i][j];
-
-            char source = sources[(start_row + i - 1) * MATRIX_SIZE + j];
-            double source_value = 0.0;
-            if (source == '-') {
-                source_value = -0.1 * center;
-            } else if (source == '+') {
-                source_value = 0.1 * (100.0 - center);
-            } else if (source == '~') {
-                source_value = 0.05 * sin(iter * 0.1);
-            }
-
-            local_new[i - 1][j] = 0.25 * (up + down + left + right) + source_value;
-
-            // Правая граница
-            j = MATRIX_SIZE - 1;
-            up = local_current[i - 1][j];
-            down = local_current[i + 1][j];
-            left = local_current[i][j - 1];
-            right = local_current[i][j]; // Инсулированная граница (изолированная)
-            center = local_current[i][j];
-
-            source = sources[(start_row + i - 1) * MATRIX_SIZE + j];
-            source_value = 0.0;
-            if (source == '-') {
-                source_value = -0.1 * center;
-            } else if (source == '+') {
-                source_value = 0.1 * (100.0 - center);
-            } else if (source == '~') {
-                source_value = 0.05 * sin(iter * 0.1);
-            }
-
-            local_new[i - 1][j] = 0.25 * (up + down + left + right) + source_value;
-        }
+        evolve_field(sources, local_rows, start_row, local_current, local_new, iter);
+        calc_bounds(sources, local_rows, start_row, local_current, local_new, iter);
 
         // Обновляем текущую матрицу
         for (int i = 1; i <= local_rows; i++) {
@@ -302,18 +270,21 @@ int main(int argc, char *argv[]) {
     fflush(stdout);
 
     // Собираем результаты на корневом процессе
-//    double **final_matrix = NULL;
     double *final_matrix = NULL; // Изменили тип на одномерный массив
     if (rank == 0) {
-        final_matrix = allocate_2D_array(MATRIX_SIZE, MATRIX_SIZE);
+        final_matrix = (double *) malloc(MATRIX_SIZE * MATRIX_SIZE * sizeof(double));
+        if (!final_matrix) {
+            perror("Не удалось выделить память для final_matrix");
+            MPI_Abort(MPI_COMM_WORLD, 1);
+        }
     }
 
-    // Подготавливаем recvcounts и displs для граничного процесса
+    // Подготавливаем recvcounts и displs для корневого процесса
     int *recvcounts = NULL;
     int *displs = NULL;
     if (rank == 0) {
-        recvcounts = (int *)malloc(size * sizeof(int));
-        displs = (int *)malloc(size * sizeof(int));
+        recvcounts = (int *) malloc(size * sizeof(int));
+        displs = (int *) malloc(size * sizeof(int));
         if (!recvcounts || !displs) {
             perror("Не удалось выделить память для recvcounts или displs");
             MPI_Abort(MPI_COMM_WORLD, 1);
@@ -325,13 +296,20 @@ int main(int argc, char *argv[]) {
             displs[i] = offset;
             offset += recvcounts[i];
         }
+
+        for (int i = 0; i < size; i++) {
+            printf("displs %d ", displs[i]);
+            printf("recvcounts %d ", recvcounts[i]);
+            fflush(stdout);
+        }
     }
+
 
     printf("Worker %d | debug_1...\n", rank);
     fflush(stdout);
 
     // Подготовка буфера для отправки
-    double *send_buffer = (double *)malloc(local_rows * MATRIX_SIZE * sizeof(double));
+    double *send_buffer = (double *) malloc(local_rows * MATRIX_SIZE * sizeof(double));
     if (!send_buffer) {
         perror("Не удалось выделить память для send_buffer");
         MPI_Abort(MPI_COMM_WORLD, 1);
@@ -345,7 +323,7 @@ int main(int argc, char *argv[]) {
 
     // Собираем все части матрицы
     MPI_Gatherv(send_buffer, local_rows * MATRIX_SIZE, MPI_DOUBLE,
-                (rank == 0) ? &(final_matrix[0]) : NULL, recvcounts, displs, MPI_DOUBLE,
+                (rank == 0) ? final_matrix : NULL, recvcounts, displs, MPI_DOUBLE,
                 0, MPI_COMM_WORLD);
 
     printf("Worker %d | debug_3...\n", rank);
@@ -354,7 +332,7 @@ int main(int argc, char *argv[]) {
     // Корневой процесс записывает итоговую матрицу
     if (rank == 0) {
         write_matrix("output.txt", final_matrix);
-        free_2D_array(final_matrix, MATRIX_SIZE);
+        free(final_matrix);
         free(recvcounts);
         free(displs);
     }
@@ -364,4 +342,82 @@ int main(int argc, char *argv[]) {
 
     MPI_Finalize();
     return 0;
+}
+
+void evolve_field(const char *sources, int local_rows, int start_row, double *const *local_current, double **local_new,
+                  int iter) {
+    for (int i = 1; i <= local_rows; i++) {
+        for (int j = 1; j < MATRIX_SIZE - 1; j++) {
+            // Среднее значение соседних ячеек
+            double up = local_current[i - 1][j];
+            double down = local_current[i + 1][j];
+            double left = local_current[i][j - 1];
+            double right = local_current[i][j + 1];
+            double center = local_current[i][j];
+
+            // Применение источников тепла
+            char source = sources[(start_row + i - 1) * MATRIX_SIZE + j];
+            double source_value = 0.0;
+            if (source == '-') {
+                source_value = -0.1 * center; // Поглощение тепла
+            } else if (source == '+') {
+                source_value = 0.1 * (100.0 - center); // Выделение тепла
+            } else if (source == '~') {
+                // Переменный источник: синусоидальный сигнал
+                source_value = 0.05 * sin(iter * 0.1);
+            }
+
+            // Обновление температуры
+//                double newValue = DT * (ALPHA * ((up - 2.0 * center + down) / (DELTA_X * DELTA_X)
+//                                                 + (left - 2.0 * center + right) / (DELTA_Y * DELTA_Y)) + source_value);
+//                local_new[i - 1][j] = newValue;
+            local_new[i - 1][j] = 0.25 * (up + down + left + right) + source_value;
+        }
+    }
+}
+
+void calc_bounds(const char *sources, int local_rows, int start_row, double *const *local_current, double **local_new,
+                 int iter) {
+    // Обработка граничных столбцов (левая и правая границы остаются фиксированными)
+    for (int i = 1; i <= local_rows; i++) {
+        // Левая граница
+        int j = 0;
+        double up = local_current[i - 1][j];
+        double down = local_current[i + 1][j];
+        double left = local_current[i][j]; // Инсулированная граница (изолированная)
+        double right = local_current[i][j + 1];
+        double center = local_current[i][j];
+
+        char source = sources[(start_row + i - 1) * MATRIX_SIZE + j];
+        double source_value = 0.0;
+        if (source == '-') {
+            source_value = -0.1 * center;
+        } else if (source == '+') {
+            source_value = 0.1 * (100.0 - center);
+        } else if (source == '~') {
+            source_value = 0.05 * sin(iter * 0.1);
+        }
+
+        local_new[i - 1][j] = 0.25 * (up + down + left + right) + source_value;;
+
+        // Правая граница
+        j = MATRIX_SIZE - 1;
+        up = local_current[i - 1][j];
+        down = local_current[i + 1][j];
+        left = local_current[i][j - 1];
+        right = local_current[i][j]; // Инсулированная граница (изолированная)
+        center = local_current[i][j];
+
+        source = sources[(start_row + i - 1) * MATRIX_SIZE + j];
+        source_value = 0.0;
+        if (source == '-') {
+            source_value = -0.1 * center;
+        } else if (source == '+') {
+            source_value = 0.1 * (100.0 - center);
+        } else if (source == '~') {
+            source_value = 0.05 * sin(iter * 0.1);
+        }
+
+        local_new[i - 1][j] = 0.25 * (up + down + left + right) + source_value;
+    }
 }
